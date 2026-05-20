@@ -737,7 +737,15 @@ function PlayPageClient() {
       }
     }
 
-    // 切到新的一集后，重新允许检查该集是否存在播放记录。
+    // 用户主动切集/自动下一集时不再弹“上次播放到 xx”。
+    // 首次进入页面仍保留检查能力，用于展示继续播放提示。
+    if (suppressPlayRecordJumpOnNextEpisodeChangeRef.current) {
+      playRecordJumpInitialCheckRef.current = false;
+      playRecordJumpDismissedRef.current = true;
+      suppressPlayRecordJumpOnNextEpisodeChangeRef.current = false;
+      return;
+    }
+
     playRecordJumpInitialCheckRef.current = true;
     playRecordJumpDismissedRef.current = false;
   }, [currentEpisodeIndex]);
@@ -1451,6 +1459,7 @@ function PlayPageClient() {
   const refreshTimerRef = useRef<NodeJS.Timeout | null>(null); // 14分钟定时器
   const currentXiaoyaUrlRef = useRef<string>(''); // 当前xiaoya原始URL（用于刷新）
   const isInitialLoadRef = useRef(true); // 标记是否为首次加载
+  const suppressPlayRecordJumpOnNextEpisodeChangeRef = useRef(false); // 主动切集时不显示播放记录跳转提示
 
   // 视频源代理模式状态
   const [sourceProxyMode, setSourceProxyMode] = useState(false);
@@ -4632,39 +4641,45 @@ function PlayPageClient() {
   // ---------------------------------------------------------------------------
   // 集数切换
   // ---------------------------------------------------------------------------
-  const primeEpisodeResumeState = async (targetEpisodeIndex: number) => {
+  const saveCurrentEpisodeLocalProgressOnly = () => {
+    if (!artPlayerRef.current) {
+      return;
+    }
+
+    const currentTime = artPlayerRef.current.currentTime || 0;
+    const duration = artPlayerRef.current.duration || 0;
+
+    if (currentTime < 1 || !duration) {
+      return;
+    }
+
+    try {
+      saveLocalEpisodeProgress(
+        episodeProgressContentKey,
+        currentEpisodeIndexRef.current,
+        currentTime,
+        duration
+      );
+    } catch (error) {
+      console.warn('[Play] Failed to save local episode progress before episode switch:', error);
+    }
+  };
+
+  const primeEpisodeResumeState = (targetEpisodeIndex: number) => {
     if (!currentSourceRef.current || !currentIdRef.current) {
       resumeTimeRef.current = null;
       return;
     }
 
-    try {
-      const allRecords = await getAllPlayRecords();
-      const key = generateStorageKey(currentSourceRef.current, currentIdRef.current);
-      const record = allRecords[key];
-
-      if (record && record.index - 1 === targetEpisodeIndex && record.play_time > 1) {
-        resumeTimeRef.current = record.play_time;
-      } else {
-        resumeTimeRef.current = loadLocalEpisodeProgress(
-          episodeProgressContentKey,
-          targetEpisodeIndex
-        );
-      }
-    } catch (error) {
-      console.warn('[Play] Failed to prime episode resume state:', error);
-      if (currentSourceRef.current && currentIdRef.current) {
-        resumeTimeRef.current = loadLocalEpisodeProgress(
-          episodeProgressContentKey,
-          targetEpisodeIndex
-        );
-      } else {
-        resumeTimeRef.current = null;
-      }
-    }
+    // 切集路径只读取本地单集进度，避免阻塞式读取全局播放记录/远端数据库。
+    // 首次进入页面的全局播放记录恢复逻辑保持不变。
+    resumeTimeRef.current = loadLocalEpisodeProgress(
+      episodeProgressContentKey,
+      targetEpisodeIndex
+    );
   };
 
-  const prepareEpisodeSwitch = async () => {
+  const prepareEpisodeSwitch = () => {
     if (artPlayerRef.current) {
       lastPlaybackRateRef.current =
         artPlayerRef.current.playbackRate || lastPlaybackRateRef.current;
@@ -4672,9 +4687,10 @@ function PlayPageClient() {
         artPlayerRef.current.volume || lastVolumeRef.current;
       playbackRateRestoreWindowUntilRef.current = Date.now() + 8000;
 
-      await saveCurrentPlayProgress();
+      saveCurrentEpisodeLocalProgressOnly();
     }
 
+    suppressPlayRecordJumpOnNextEpisodeChangeRef.current = true;
     setVideoLoadingStage('episodeChanging');
     setIsVideoLoading(true);
     setVideoError(null);
@@ -4690,8 +4706,8 @@ function PlayPageClient() {
       return;
     }
 
-    await prepareEpisodeSwitch();
-    await primeEpisodeResumeState(episodeNumber);
+    prepareEpisodeSwitch();
+    primeEpisodeResumeState(episodeNumber);
     setCurrentEpisodeIndex(episodeNumber);
   };
 
@@ -4699,9 +4715,9 @@ function PlayPageClient() {
     const d = detailRef.current;
     const idx = currentEpisodeIndexRef.current;
     if (d && d.episodes && idx > 0) {
-      await prepareEpisodeSwitch();
       const targetIndex = idx - 1;
-      await primeEpisodeResumeState(targetIndex);
+      prepareEpisodeSwitch();
+      primeEpisodeResumeState(targetIndex);
       setCurrentEpisodeIndex(targetIndex);
     }
   };
@@ -4726,8 +4742,8 @@ function PlayPageClient() {
       const isFiltered = episodeTitle && isEpisodeFilteredByTitle(episodeTitle);
 
       if (!isFiltered) {
-        await prepareEpisodeSwitch();
-        await primeEpisodeResumeState(nextIdx);
+        prepareEpisodeSwitch();
+        primeEpisodeResumeState(nextIdx);
         setCurrentEpisodeIndex(nextIdx);
         return;
       }
